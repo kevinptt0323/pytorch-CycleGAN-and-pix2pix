@@ -7,6 +7,7 @@ import numpy as np
 import torch.utils.data as data
 from PIL import Image
 import torchvision.transforms as transforms
+import torchvision.transforms.functional as F
 from abc import ABC, abstractmethod
 
 
@@ -80,8 +81,9 @@ def get_params(opt, size):
 
 def get_transform(opt, params=None, grayscale=False, method=Image.BICUBIC, convert=True):
     transform_list = []
-    if grayscale:
-        transform_list.append(transforms.Grayscale(1))
+
+    transform_list.append(transforms.Lambda(lambda img: __color(img, grayscale)))
+
     if 'resize' in opt.preprocess:
         osize = [opt.load_size, opt.load_size]
         transform_list.append(transforms.Resize(osize, method))
@@ -104,12 +106,18 @@ def get_transform(opt, params=None, grayscale=False, method=Image.BICUBIC, conve
             transform_list.append(transforms.Lambda(lambda img: __flip(img, params['flip'])))
 
     if convert:
-        transform_list += [transforms.ToTensor()]
-        if grayscale:
-            transform_list += [transforms.Normalize((0.5,), (0.5,))]
-        else:
-            transform_list += [transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))]
+        transform_list += [transforms.ToTensor(),
+                           transforms.Lambda(lambda img: __normalize(img, 1 if grayscale else 3))]
     return transforms.Compose(transform_list)
+
+
+def __color(img, grayscale):
+    if grayscale:
+        if not img.mode in ['I', 'I;16', 'F']:
+            return F.to_grayscale(img, 1)
+        return img
+    else:
+        return img.convert('RGB')
 
 
 def __make_power_2(img, base, method=Image.BICUBIC):
@@ -145,6 +153,18 @@ def __flip(img, flip):
     if flip:
         return img.transpose(Image.FLIP_LEFT_RIGHT)
     return img
+
+
+def __normalize(tensor, num_channels):
+    if tensor.max() >= 65536:
+        raise ValueError("tensor.max() should be less than 65536")
+    elif 256 <= tensor.max() < 65536:
+        mean = std = 65536 / 2
+    elif 1 < tensor.max() < 256:
+        mean = std = 256 / 2
+    else:
+        mean = std = 1 / 2
+    return F.normalize(tensor.float(), [mean] * num_channels, [std] * num_channels)
 
 
 def __print_size_warning(ow, oh, w, h):
