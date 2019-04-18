@@ -115,7 +115,7 @@ def __color(img, grayscale):
     if grayscale:
         if not img.mode in ['I', 'I;16', 'F']:
             return F.to_grayscale(img, 1)
-        return img
+        return img.convert('F')
     else:
         return img.convert('RGB')
 

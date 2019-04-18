@@ -28,6 +28,26 @@ def get_norm_layer(norm_type='instance'):
     return norm_layer
 
 
+def get_norm_layer_1d(norm_type='instance'):
+    """Return a normalization layer
+
+    Parameters:
+        norm_type (str) -- the name of the normalization layer: batch | instance | none
+
+    For BatchNorm, we use learnable affine parameters and track running statistics (mean/stddev).
+    For InstanceNorm, we do not use learnable affine parameters. We do not track running statistics.
+    """
+    if norm_type == 'batch':
+        norm_layer = functools.partial(nn.BatchNorm1d, affine=True, track_running_stats=True)
+    elif norm_type == 'instance':
+        norm_layer = functools.partial(nn.InstanceNorm1d, affine=False, track_running_stats=False)
+    elif norm_type == 'none':
+        norm_layer = None
+    else:
+        raise NotImplementedError('normalization layer [%s] is not found' % norm_type)
+    return norm_layer
+
+
 def get_scheduler(optimizer, opt):
     """Return a learning rate scheduler
 
@@ -193,6 +213,28 @@ def define_D(input_nc, ndf, netD, n_layers_D=3, norm='batch', init_type='normal'
         net = PixelDiscriminator(input_nc, ndf, norm_layer=norm_layer)
     else:
         raise NotImplementedError('Discriminator model name [%s] is not recognized' % net)
+    return init_net(net, init_type, init_gain, gpu_ids)
+
+
+def define_T(input_nc, input_shape, ntf, stf, norm='batch', init_type='normal', init_gain=0.02, gpu_ids=[]):
+    """Create a trapper
+
+    Parameters:
+        input_nc (int)     -- the number of channels in input images
+        ntf (int)          -- the number of filters in the first conv layer
+        norm (str)         -- the type of normalization layers used in the network.
+        init_type (str)    -- the name of the initialization method.
+        init_gain (float)  -- scaling factor for normal, xavier and orthogonal.
+        gpu_ids (int list) -- which GPUs the network runs on: e.g., 0,1,2
+
+    Returns a trapper
+
+    The trapper has been initialized by <init_net>. It uses Leakly RELU for non-linearity.
+    """
+    net = None
+    norm_layer_1d = get_norm_layer_1d(norm_type=norm)
+
+    net = SentenceTrapper(input_nc, input_shape, ntf, stf, norm_layer=norm_layer_1d)
     return init_net(net, init_type, init_gain, gpu_ids)
 
 
@@ -607,3 +649,50 @@ class PixelDiscriminator(nn.Module):
     def forward(self, input):
         """Standard forward."""
         return self.net(input)
+
+
+class SentenceTrapper(nn.Module):
+    """Define a CNN Sentence model"""
+    def __init__(self, input_nc, input_shape, ntf, stf, norm_layer=nn.BatchNorm1d):
+        """Construct a CNN Sentence model
+
+        Parameters:
+            input_nc (int)  -- the number of channels in input images
+            input_shape (int tuple) -- the shape of input images
+            ntf (int)       -- the number of filters in the first conv layer
+            stf (int list)  -- the size of filters in the first conv layer
+            norm_layer      -- normalization layer
+        """
+        super(SentenceTrapper, self).__init__()
+        if type(norm_layer) == functools.partial:  # no need to use bias as BatchNorm2d has affine parameters
+            use_bias = norm_layer.func != nn.InstanceNorm1d
+        else:
+            use_bias = norm_layer != nn.InstanceNorm1d
+
+        self.convs = nn.ModuleList([nn.Conv2d(input_nc, ntf, kernel_size=(s, input_shape[1]), stride=1, padding=0) for s in stf])
+        self.alpha = 0.25
+
+        self.net = [
+            nn.LeakyReLU(0.2, True),
+            nn.Conv1d(ntf, ntf * 2, kernel_size=1, stride=1, padding=0, bias=use_bias),
+            norm_layer(ntf * 2),
+            nn.LeakyReLU(0.2, True),
+            nn.Conv1d(ntf * 2, 1, kernel_size=1, stride=1, padding=0, bias=use_bias),
+            nn.Linear(sum([input_shape[0] - s + 1 for s in stf]), input_shape[0])]
+
+        self.net = nn.Sequential(*self.net)
+
+    def forward(self, input):
+        """Standard forward."""
+        x = [conv(input).squeeze(3) for conv in self.convs]
+        x = torch.cat(x, 2)
+        x =  self.net(x)
+
+        k = int(x.shape[2] * self.alpha)
+        try:
+            kth = torch.kthvalue(x, k + 1, 2, keepdim=True)
+        except RuntimeError:
+            kth = torch.topk(x, k + 1, 2, largest=False, sorted=True)[0][:,:,-1:]
+        mask = torch.lt(x, kth).expand(*input.shape).transpose(2, 3)
+
+        return torch.where(mask, input, -torch.ones_like(input))
