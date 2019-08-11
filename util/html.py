@@ -65,6 +65,10 @@ class HTML:
                             br()
                             p(txt)
 
+    def add_text(self, text):
+        with self.doc:
+            p(text)
+
     def save(self):
         """save the current content to the HMTL file"""
         html_file = '%s/index.html' % self.web_dir

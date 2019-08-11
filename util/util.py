@@ -4,6 +4,7 @@ import torch
 import numpy as np
 from PIL import Image
 import os
+from skimage.transform import iradon, iradon_sart
 
 
 def tensor2im(input_image, imtype=np.uint8):
@@ -94,3 +95,33 @@ def mkdir(path):
     """
     if not os.path.exists(path):
         os.makedirs(path)
+
+def normalize(arr):
+    return (arr - np.amin(arr)) / (np.amax(arr) - np.amin(arr))
+
+def reconstruct_tomo(input_image, shift_x=0, theta=None):
+    if isinstance(input_image, torch.Tensor):  # get the data from a variable
+        if input_image.dim() > 2:
+            return reconstruct_tomo(input_image[0], shift_x, theta)
+        image_tensor = input_image.data
+        image = image_tensor.cpu().double().numpy()  # convert it into a numpy array
+    else:
+        image = input_image
+
+    sinogram_raw = image
+
+    sinogram = sinogram_raw.transpose()
+    sinogram = -sinogram + 1
+    sinogram_pad = np.pad(sinogram, ((sinogram.shape[0]//2,), (0,)), 'edge')
+    if shift_x > 0:
+        sinogram_pad = sinogram_pad[:-shift_x*2]
+    elif shift_x < 0:
+        sinogram_pad = sinogram_pad[-shift_x*2:]
+
+    if theta is None:
+        theta = np.linspace(0., 180., sinogram.shape[1], endpoint=False)
+    # reconstruction = iradon(sinogram_pad, theta=theta, output_size=sinogram.shape[0], circle=False)
+    reconstruction_sart = iradon_sart(sinogram_pad, theta=theta)
+    x = (reconstruction_sart.shape[0] - sinogram.shape[0]) // 2
+    reconstruction = reconstruction_sart[x:x+sinogram.shape[0],x:x+sinogram.shape[0]]
+    return normalize(reconstruction) * 255, sinogram_raw

@@ -1,9 +1,13 @@
+import random
 import torch
 import torch.nn as nn
 from torch.nn import init
 import functools
 from torch.optim import lr_scheduler
 
+class Identity(nn.Module):
+    def forward(self, x):
+        return x
 
 ###############################################################################
 # Helper Functions
@@ -21,8 +25,10 @@ def get_norm_layer(norm_type='instance'):
         norm_layer = functools.partial(nn.BatchNorm2d, affine=True, track_running_stats=True)
     elif norm_type == 'instance':
         norm_layer = functools.partial(nn.InstanceNorm2d, affine=False, track_running_stats=False)
+    elif norm_type == 'layer':
+        norm_layer = functools.partial(lambda nc, *args, **kwargs: nn.GroupNorm(nc, nc, *args, **kwargs), affine=False)
     elif norm_type == 'none':
-        norm_layer = None
+        norm_layer = lambda *args, **kwargs: nn.Sequential()
     else:
         raise NotImplementedError('normalization layer [%s] is not found' % norm_type)
     return norm_layer
@@ -41,8 +47,10 @@ def get_norm_layer_1d(norm_type='instance'):
         norm_layer = functools.partial(nn.BatchNorm1d, affine=True, track_running_stats=True)
     elif norm_type == 'instance':
         norm_layer = functools.partial(nn.InstanceNorm1d, affine=False, track_running_stats=False)
+    elif norm_type == 'layer':
+        norm_layer = functools.partial(lambda nc, *args, **kwargs: nn.GroupNorm(nc, nc, *args, **kwargs), affine=False)
     elif norm_type == 'none':
-        norm_layer = None
+        norm_layer = lambda *args, **kwargs: nn.Sequential()
     else:
         raise NotImplementedError('normalization layer [%s] is not found' % norm_type)
     return norm_layer
@@ -216,12 +224,15 @@ def define_D(input_nc, ndf, netD, n_layers_D=3, norm='batch', init_type='normal'
     return init_net(net, init_type, init_gain, gpu_ids)
 
 
-def define_T(input_nc, input_shape, ntf, stf, norm='batch', init_type='normal', init_gain=0.02, gpu_ids=[]):
+def define_T(input_nc, input_shape, netT, ntf, stf, alpha, norm='batch', init_type='normal', init_gain=0.02, gpu_ids=[]):
     """Create a trapper
 
     Parameters:
         input_nc (int)     -- the number of channels in input images
+        input_shape (int tuple) -- the shape of input images
         ntf (int)          -- the number of filters in the first conv layer
+        stf (int list)     -- the size of filters in the first conv layer
+        alpha (function)   -- function to generate proportion of retained data
         norm (str)         -- the type of normalization layers used in the network.
         init_type (str)    -- the name of the initialization method.
         init_gain (float)  -- scaling factor for normal, xavier and orthogonal.
@@ -234,7 +245,20 @@ def define_T(input_nc, input_shape, ntf, stf, norm='batch', init_type='normal', 
     net = None
     norm_layer_1d = get_norm_layer_1d(norm_type=norm)
 
-    net = SentenceTrapper(input_nc, input_shape, ntf, stf, norm_layer=norm_layer_1d)
+    if not callable(alpha):
+        _alpha = alpha
+        alpha = lambda: _alpha
+
+    if netT == 'sentence':
+        net = SentenceTrapper(input_nc, input_shape, ntf, stf, alpha, norm_layer=norm_layer_1d)
+    elif netT == 'uniform-sentence':
+        net = UniformSentenceTrapper(input_nc, input_shape, ntf, stf, alpha, norm_layer=norm_layer_1d)
+    elif netT == 'uniform':
+        net = UniformTrapper(input_nc, input_shape, alpha)
+    elif netT == 'downsample':
+        net = DownsampleTrapper(input_nc, input_shape, alpha)
+    else:
+        raise NotImplementedError('Trapper model name [%s] is not recognized' % netT)
     return init_net(net, init_type, init_gain, gpu_ids)
 
 
@@ -252,7 +276,7 @@ class GANLoss(nn.Module):
         """ Initialize the GANLoss class.
 
         Parameters:
-            gan_mode (str) - - the type of GAN objective. It currently supports vanilla, lsgan, and wgangp.
+            gan_mode (str) - - the type of GAN objective. It currently supports vanilla, lsgan, and wgan-gp.
             target_real_label (bool) - - label for a real image
             target_fake_label (bool) - - label of a fake image
 
@@ -267,7 +291,7 @@ class GANLoss(nn.Module):
             self.loss = nn.MSELoss()
         elif gan_mode == 'vanilla':
             self.loss = nn.BCEWithLogitsLoss()
-        elif gan_mode in ['wgangp']:
+        elif gan_mode in ['wgan-gp']:
             self.loss = None
         else:
             raise NotImplementedError('gan mode %s not implemented' % gan_mode)
@@ -302,12 +326,154 @@ class GANLoss(nn.Module):
         if self.gan_mode in ['lsgan', 'vanilla']:
             target_tensor = self.get_target_tensor(prediction, target_is_real)
             loss = self.loss(prediction, target_tensor)
-        elif self.gan_mode == 'wgangp':
+        elif self.gan_mode == 'wgan-gp':
             if target_is_real:
                 loss = -prediction.mean()
             else:
                 loss = prediction.mean()
         return loss
+
+class GANLossV2(nn.Module):
+    """Define different GAN Discriminator's objectives.
+    The GANLoss class abstracts away the need to create the target label tensor
+    that has the same size as the input.
+    """
+
+    def __init__(self, loss_mode, which_net, which_D, target_real_label=1.0, target_fake_label=0.0):
+        """ Initialize the GAN's Discriminator Loss class.
+        Parameters:
+            loss_mode (str) - - the type of GAN objective. It currently supports vanilla, lsgan, and wgan-gp.
+            target_real_label (bool) - - label for a real image
+            target_fake_label (bool) - - label of a fake image
+        Note: Do not use sigmoid as the last layer of Discriminator.
+        LSGAN needs no sigmoid. vanilla GANs will handle it with BCEWithLogitsLoss.
+        """
+        super(GANLossV2, self).__init__()
+        self.register_buffer('real_label', torch.tensor(target_real_label))
+        self.register_buffer('fake_label', torch.tensor(target_fake_label))
+        self.loss_mode = loss_mode
+        self.which_net = which_net
+        self.which_D = which_D
+
+        if loss_mode == 'lsgan':
+            self.loss = nn.MSELoss()
+        elif loss_mode in ['vanilla', 'nsgan', 'rsgan', 'rsgan']:
+            self.loss = nn.BCEWithLogitsLoss()
+        elif loss_mode in ['wgan', 'hinge']:
+            self.loss = None
+        else:
+            raise NotImplementedError('gan mode %s not implemented' % loss_mode)
+
+    def get_target_tensor(self, prediction, target_is_real):
+        """Create label tensors with the same size as the input.
+        Parameters:
+            prediction (tensor) - - tpyically the prediction from a discriminator
+            target_is_real (bool) - - if the ground truth label is for real images or fake images
+        Returns:
+            A label tensor filled with ground truth label, and with the size of the input
+        """
+        if target_is_real:
+            target_tensor = self.real_label
+        else:
+            target_tensor = self.fake_label
+        return target_tensor.expand_as(prediction)
+
+    def G_loss(self, Dfake, Dreal):
+        real_tensor = self.get_target_tensor(Dreal, True)
+        fake_tensor = self.get_target_tensor(Dreal, False)
+
+        if self.which_D == 'S':
+            prediction_fake = Dfake
+            prediction_real = real_tensor if self.loss_mode in ['vanilla'] else fake_tensor
+        elif self.which_D == 'Ra':
+            prediction_fake = Dfake - torch.mean(Dreal)
+            prediction_real = Dreal - torch.mean(Dfake)
+        else:
+            raise NotImplementedError('which_D name [%s] is not recognized' % self.which_D)
+
+        if self.loss_mode in ['lsgan', 'nsgan', 'vanilla']:
+            loss_fake = self.loss(prediction_fake, real_tensor)
+            loss_real = self.loss(prediction_real, fake_tensor)
+        elif self.loss_mode == 'vanilla':
+            loss_fake = -self.loss(prediction_fake, fake_tensor)
+            loss_real = -self.loss(prediction_real, real_tensor)
+        elif self.loss_mode in ['wgan', 'hinge'] and self.which_D == 'S':
+            loss_fake = -prediction_fake.mean()
+            loss_real =  prediction_real.mean()
+        elif self.loss_mode == 'hinge' and self.which_D == 'Ra':
+            loss_fake = nn.ReLU()(1.0 - prediction_fake).mean()
+            loss_real = nn.ReLU()(1.0 + prediction_real).mean()
+        elif self.loss_mode == 'rsgan':
+            loss_fake = self.loss(Dfake - Dreal, real_tensor)
+            loss_real = 0.
+        elif self.loss_mode == 'rsgan-gp':
+            loss_fake = prediction_real.mean() - prediction_fake.mean()
+            loss_real = 0.
+        else:
+            raise NotImplementedError('loss_mode name [%s] is not recognized' % self.loss_mode)
+
+        return loss_fake, loss_real
+
+    def D_loss(self, Dfake, Dreal):
+        real_tensor = self.get_target_tensor(Dreal, True)
+        fake_tensor = self.get_target_tensor(Dreal, False)
+
+        if self.which_D == 'S':
+            prediction_fake = Dfake
+            prediction_real = Dreal
+        elif self.which_D == 'Ra':
+            prediction_fake = Dfake - torch.mean(Dreal)
+            prediction_real = Dreal - torch.mean(Dfake)
+        else:
+            raise NotImplementedError('which_D name [%s] is not recognized' % self.which_D)
+
+        if self.loss_mode in ['lsgan', 'nsgan', 'vanilla']:
+            loss_fake = self.loss(prediction_fake, fake_tensor)
+            loss_real = self.loss(prediction_real, real_tensor)
+        elif self.loss_mode == 'wgan':
+            loss_fake =  prediction_fake.mean()
+            loss_real = -prediction_real.mean()
+        elif self.loss_mode == 'hinge':
+            loss_fake = nn.ReLU()(1.0 + prediction_fake).mean()
+            loss_real = nn.ReLU()(1.0 - prediction_real).mean()
+        elif self.loss_mode == 'rsgan':
+            loss_fake = 0.
+            loss_real = self.loss(Dreal - Dfake, real_tensor)
+        elif self.loss_mode == 'rsgan-gp':
+            loss_fake = 0.
+            loss_real = prediction_fake.mean() - prediction_real.mean()
+        else:
+            raise NotImplementedError('loss_mode name [%s] is not recognized' % self.loss_mode)
+
+        return loss_fake, loss_real
+
+    def __call__(self, Dfake, Dreal):
+        """Calculate loss given Discriminator's output and grount truth labels.
+        Parameters:
+            prediction (tensor) - - tpyically the prediction output from a discriminator
+            target_is_real (bool) - - if the ground truth label is for real images or fake images
+        Returns:
+            the calculated loss.
+        """
+        if self.which_net == 'G':
+            loss_fake, loss_real = self.G_loss(Dfake, Dreal)
+            return loss_fake, loss_real
+        elif self.which_net == 'D':
+            loss_fake, loss_real = self.D_loss(Dfake, Dreal)
+            return loss_fake, loss_real
+        else:
+            raise NotImplementedError('which_net name [%s] is not recognized' % self.which_net)
+
+
+class TVLoss(nn.Module):
+    def __init__(self):
+        super(TVLoss, self).__init__()
+        self.loss = nn.L1Loss()
+
+    def __call__(self, x):
+        h_tv = self.loss(x[:,:,1:,:], x[:,:,:-1,:])
+        w_tv = self.loss(x[:,:,:,1:], x[:,:,:,:-1])
+        return (h_tv + w_tv) / 4
 
 
 def cal_gradient_penalty(netD, real_data, fake_data, device, type='mixed', constant=1.0, lambda_gp=10.0):
@@ -330,9 +496,8 @@ def cal_gradient_penalty(netD, real_data, fake_data, device, type='mixed', const
         elif type == 'fake':
             interpolatesv = fake_data
         elif type == 'mixed':
-            alpha = torch.rand(real_data.shape[0], 1)
+            alpha = torch.rand(real_data.shape[0], 1, device=device)
             alpha = alpha.expand(real_data.shape[0], real_data.nelement() // real_data.shape[0]).contiguous().view(*real_data.shape)
-            alpha = alpha.to(device)
             interpolatesv = alpha * real_data + ((1 - alpha) * fake_data)
         else:
             raise NotImplementedError('{} not implemented'.format(type))
@@ -369,9 +534,9 @@ class ResnetGenerator(nn.Module):
         assert(n_blocks >= 0)
         super(ResnetGenerator, self).__init__()
         if type(norm_layer) == functools.partial:
-            use_bias = norm_layer.func == nn.InstanceNorm2d
+            use_bias = norm_layer.func != nn.BatchNorm2d
         else:
-            use_bias = norm_layer == nn.InstanceNorm2d
+            use_bias = norm_layer != nn.BatchNorm2d
 
         model = [nn.ReflectionPad2d(3),
                  nn.Conv2d(input_nc, ngf, kernel_size=7, padding=0, bias=use_bias),
@@ -524,9 +689,9 @@ class UnetSkipConnectionBlock(nn.Module):
         super(UnetSkipConnectionBlock, self).__init__()
         self.outermost = outermost
         if type(norm_layer) == functools.partial:
-            use_bias = norm_layer.func == nn.InstanceNorm2d
+            use_bias = norm_layer.func != nn.BatchNorm2d
         else:
-            use_bias = norm_layer == nn.InstanceNorm2d
+            use_bias = norm_layer != nn.BatchNorm2d
         if input_nc is None:
             input_nc = outer_nc
         downconv = nn.Conv2d(input_nc, inner_nc, kernel_size=4,
@@ -540,6 +705,7 @@ class UnetSkipConnectionBlock(nn.Module):
             upconv = nn.ConvTranspose2d(inner_nc * 2, outer_nc,
                                         kernel_size=4, stride=2,
                                         padding=1)
+
             down = [downconv]
             up = [uprelu, upconv, nn.Tanh()]
             model = down + [submodule] + up
@@ -594,6 +760,7 @@ class NLayerDiscriminator(nn.Module):
         sequence = [nn.Conv2d(input_nc, ndf, kernel_size=kw, stride=2, padding=padw), nn.LeakyReLU(0.2, True)]
         nf_mult = 1
         nf_mult_prev = 1
+        self.use_fc = False
         for n in range(1, n_layers):  # gradually increase the number of filters
             nf_mult_prev = nf_mult
             nf_mult = min(2 ** n, 8)
@@ -612,11 +779,20 @@ class NLayerDiscriminator(nn.Module):
         ]
 
         sequence += [nn.Conv2d(ndf * nf_mult, 1, kernel_size=kw, stride=1, padding=padw)]  # output 1 channel prediction map
+        if self.use_fc:
+            sequence += [
+                norm_layer(1),
+                nn.LeakyReLU(0.2, True)
+            ]
+            self.fc = nn.Linear((256 // (2 ** n_layers) - 2) ** 2, 1)
         self.model = nn.Sequential(*sequence)
 
     def forward(self, input):
         """Standard forward."""
-        return self.model(input)
+        x = self.model(input)
+        if self.use_fc:
+            x = self.fc(x.view(x.shape[0], -1))
+        return x
 
 
 class PixelDiscriminator(nn.Module):
@@ -632,9 +808,9 @@ class PixelDiscriminator(nn.Module):
         """
         super(PixelDiscriminator, self).__init__()
         if type(norm_layer) == functools.partial:  # no need to use bias as BatchNorm2d has affine parameters
-            use_bias = norm_layer.func != nn.InstanceNorm2d
+            use_bias = norm_layer.func != nn.BatchNorm2d
         else:
-            use_bias = norm_layer != nn.InstanceNorm2d
+            use_bias = norm_layer != nn.BatchNorm2d
 
         self.net = [
             nn.Conv2d(input_nc, ndf, kernel_size=1, stride=1, padding=0),
@@ -653,7 +829,7 @@ class PixelDiscriminator(nn.Module):
 
 class SentenceTrapper(nn.Module):
     """Define a CNN Sentence model"""
-    def __init__(self, input_nc, input_shape, ntf, stf, norm_layer=nn.BatchNorm1d):
+    def __init__(self, input_nc, input_shape, ntf, stf, alpha, norm_layer=nn.BatchNorm1d):
         """Construct a CNN Sentence model
 
         Parameters:
@@ -661,16 +837,66 @@ class SentenceTrapper(nn.Module):
             input_shape (int tuple) -- the shape of input images
             ntf (int)       -- the number of filters in the first conv layer
             stf (int list)  -- the size of filters in the first conv layer
+            alpha (function) -- function to generate proportion of retained data
             norm_layer      -- normalization layer
         """
         super(SentenceTrapper, self).__init__()
         if type(norm_layer) == functools.partial:  # no need to use bias as BatchNorm2d has affine parameters
-            use_bias = norm_layer.func != nn.InstanceNorm1d
+            use_bias = norm_layer.func != nn.BatchNorm1d
         else:
-            use_bias = norm_layer != nn.InstanceNorm1d
+            use_bias = norm_layer != nn.BatchNorm1d
 
         self.convs = nn.ModuleList([nn.Conv2d(input_nc, ntf, kernel_size=(s, input_shape[1]), stride=1, padding=0) for s in stf])
-        self.alpha = 0.25
+        self.alpha = alpha
+
+        self.net = [
+            nn.LeakyReLU(0.2, True),
+            nn.Conv1d(ntf, ntf * 2, kernel_size=1, stride=1, padding=0, bias=use_bias),
+            norm_layer(ntf * 2),
+            nn.LeakyReLU(0.2, True),
+            nn.Conv1d(ntf * 2, 1, kernel_size=1, stride=1, padding=0, bias=use_bias),
+            nn.Linear(sum([input_shape[0] - s + 1 for s in stf]), input_shape[0])]
+
+        self.net = nn.Sequential(*self.net)
+
+    def forward(self, input):
+        """Standard forward."""
+        alpha = self.alpha()
+        x = [conv(input).squeeze(3) for conv in self.convs]
+        x = torch.cat(x, 2)
+        x = self.net(x)
+
+        k = int(x.shape[2] * alpha + 0.5)
+        try:
+            kth = torch.kthvalue(x, k + 1, 2, keepdim=True)
+        except RuntimeError:
+            kth = torch.topk(x, k + 1, 2, largest=False, sorted=True)[0][:,:,-1:]
+        mask = torch.lt(x, kth).unsqueeze(-1).expand(*input.shape)
+        mask_f = mask.float() * 2 - 1
+
+        return torch.where(mask, input, -torch.ones_like(input)), mask_f
+
+class UniformSentenceTrapper(nn.Module):
+    """Define a CNN Sentence model"""
+    def __init__(self, input_nc, input_shape, ntf, stf, alpha, norm_layer=nn.BatchNorm1d):
+        """Construct a CNN Sentence model
+
+        Parameters:
+            input_nc (int)  -- the number of channels in input images
+            input_shape (int tuple) -- the shape of input images
+            ntf (int)       -- the number of filters in the first conv layer
+            stf (int list)  -- the size of filters in the first conv layer
+            alpha (function) -- function to generate proportion of retained data
+            norm_layer      -- normalization layer
+        """
+        super(UniformSentenceTrapper, self).__init__()
+        if type(norm_layer) == functools.partial:  # no need to use bias as BatchNorm2d has affine parameters
+            use_bias = norm_layer.func != nn.BatchNorm1d
+        else:
+            use_bias = norm_layer != nn.BatchNorm1d
+
+        self.convs = nn.ModuleList([nn.Conv2d(input_nc, ntf, kernel_size=(s, input_shape[1]), stride=1, padding=0) for s in stf])
+        self.alpha = alpha
 
         self.net = [
             nn.LeakyReLU(0.2, True),
@@ -686,13 +912,53 @@ class SentenceTrapper(nn.Module):
         """Standard forward."""
         x = [conv(input).squeeze(3) for conv in self.convs]
         x = torch.cat(x, 2)
-        x =  self.net(x)
+        x = self.net(x)
 
-        k = int(x.shape[2] * self.alpha)
-        try:
-            kth = torch.kthvalue(x, k + 1, 2, keepdim=True)
-        except RuntimeError:
-            kth = torch.topk(x, k + 1, 2, largest=False, sorted=True)[0][:,:,-1:]
-        mask = torch.lt(x, kth).expand(*input.shape).transpose(2, 3)
+        mask = -torch.ones_like(input)
+        for x_i, mask_i in zip(x, mask):
+            interval = int(1 / self.alpha() + 0.5)
+            padRight = interval - ((x_i.shape[1] - 1) % interval + 1)
+            aligned = nn.functional.pad(x_i[0], (0, padRight)).view(-1, interval)
+            maxDim = aligned.sum(dim=0).max(dim=0)[1]
+            mask_i[:,maxDim::interval] = 1
 
-        return torch.where(mask, input, -torch.ones_like(input))
+        return torch.where(mask > 0, input, -torch.ones_like(input)), mask
+
+class UniformTrapper(nn.Module):
+    """Define a uniform trapper model"""
+    def __init__(self, input_nc, input_shape, alpha):
+        """
+            alpha (function) -- function to generate proportion of retained data
+        """
+        super(UniformTrapper, self).__init__()
+
+        self.alpha = alpha
+        self.net = nn.Sequential()
+
+    def forward(self, input):
+        mask = -torch.ones_like(input)
+        for m in mask:
+            interval = int(1 / self.alpha() + 0.5)
+            offset = random.randint(0, interval - 1)
+            m[:,offset::interval,:] = 1
+        return torch.where(mask > 0, input, -torch.ones_like(input)), mask
+
+
+class DownsampleTrapper(nn.Module):
+    """Define a uniform trapper model"""
+    def __init__(self, input_nc, input_shape, alpha):
+        """
+        """
+        super(DownsampleTrapper, self).__init__()
+
+        self.alpha = alpha
+
+        self.net = [
+            nn.UpsamplingBilinear2d(size=input_shape)
+        ]
+
+        self.net = nn.Sequential(*self.net)
+
+    def forward(self, input):
+        interval = int(1 / self.alpha() + 0.5)
+        return self.net(input[:,:,::interval,:]), torch.ones_like(input)
