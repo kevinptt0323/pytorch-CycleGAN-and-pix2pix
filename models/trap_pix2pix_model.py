@@ -68,7 +68,7 @@ class TrapPix2PixModel(BaseModel):
         self.netG = networks.define_G(opt.input_nc + mask_nc, opt.output_nc, opt.ngf, opt.netG, opt.norm,
                                       not opt.no_dropout, opt.init_type, opt.init_gain, self.gpu_ids)
 
-        self.netT = networks.define_T(opt.input_nc, (opt.crop_size, opt.crop_size), opt.netT, opt.ntf, opt.stf, self.rand_alpha,
+        self.netT = networks.define_T(opt.input_nc, opt.crop_size, opt.netT, opt.ntf, opt.stf, self.rand_alpha,
                                       opt.norm, opt.init_type, opt.init_gain, self.gpu_ids)
 
         if self.isTrain:  # define a discriminator; conditional GANs need to take both input and output images; Therefore, #channels for D is input_nc + output_nc

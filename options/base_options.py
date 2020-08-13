@@ -47,8 +47,8 @@ class BaseOptions():
         parser.add_argument('--serial_batches', action='store_true', help='if true, takes images in order to make batches, otherwise takes them randomly')
         parser.add_argument('--num_threads', default=4, type=int, help='# threads for loading data')
         parser.add_argument('--batch_size', type=int, default=1, help='input batch size')
-        parser.add_argument('--load_size', type=int, default=286, help='scale images to this size')
-        parser.add_argument('--crop_size', type=int, default=256, help='then crop to this size')
+        parser.add_argument('--load_size', type=str, default="286", help='scale images to this size, e.g., "286", "286,1024"')
+        parser.add_argument('--crop_size', type=str, default="256", help='then crop to this size, e.g., "256", "256,1024"')
         parser.add_argument('--max_dataset_size', type=int, default=float("inf"), help='Maximum number of samples allowed per dataset. If the dataset directory contains more than max_dataset_size, only a subset is loaded.')
         parser.add_argument('--num_data', type=int, default=float("inf"), help='how many images to run for each epoch')
         parser.add_argument('--preprocess', type=str, default='resize_and_crop', help='scaling and cropping of images at load time [resize_and_crop | crop | scale_width | scale_width_and_crop | none]')
@@ -144,6 +144,10 @@ class BaseOptions():
             s = int(s)
             if s > 0:
                 opt.stf.append(s)
+
+        # set load_size and crop_size
+        opt.load_size = (list(map(int, opt.load_size.split(','))) * 2)[:2]
+        opt.crop_size = (list(map(int, opt.crop_size.split(','))) * 2)[:2]
 
         self.opt = opt
         return self.opt

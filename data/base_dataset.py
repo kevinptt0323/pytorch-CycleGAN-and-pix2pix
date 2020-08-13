@@ -66,13 +66,13 @@ def get_params(opt, size):
     new_h = h
     new_w = w
     if opt.preprocess == 'resize_and_crop':
-        new_h = new_w = opt.load_size
+        new_w, new_h = opt.load_size
     elif opt.preprocess == 'scale_width_and_crop':
-        new_w = opt.load_size
-        new_h = opt.load_size * h // w
+        new_w = opt.load_size[0]
+        new_h = opt.load_size[0] * h // w
 
-    x = random.randint(0, np.maximum(0, new_w - opt.crop_size))
-    y = random.randint(0, np.maximum(0, new_h - opt.crop_size))
+    x = random.randint(0, np.maximum(0, new_w - opt.crop_size[0]))
+    y = random.randint(0, np.maximum(0, new_h - opt.crop_size[1]))
 
     flip = random.random() > 0.5
 
@@ -85,8 +85,7 @@ def get_transform(opt, params=None, grayscale=False, method=Image.BICUBIC, conve
     transform_list.append(transforms.Lambda(lambda img: __color(img, grayscale)))
 
     if 'resize' in opt.preprocess:
-        osize = [opt.load_size, opt.load_size]
-        transform_list.append(transforms.Resize(osize, method))
+        transform_list.append(transforms.Resize(opt.load_size, method))
     elif 'scale_width' in opt.preprocess:
         transform_list.append(transforms.Lambda(lambda img: __scale_width(img, opt.load_size, method)))
 
@@ -110,6 +109,10 @@ def get_transform(opt, params=None, grayscale=False, method=Image.BICUBIC, conve
                            transforms.Lambda(lambda img: __normalize(img, 1 if grayscale else 3))]
     return transforms.Compose(transform_list)
 
+
+def __debug(img):
+    print(img.getextrema())
+    return img
 
 def __color(img, grayscale):
     if grayscale:
@@ -143,7 +146,7 @@ def __scale_width(img, target_width, method=Image.BICUBIC):
 def __crop(img, pos, size):
     ow, oh = img.size
     x1, y1 = pos
-    tw = th = size
+    tw, th = size
     if (ow > tw or oh > th):
         return img.crop((x1, y1, x1 + tw, y1 + th))
     return img
