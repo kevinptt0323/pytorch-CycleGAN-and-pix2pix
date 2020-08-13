@@ -1,13 +1,24 @@
+DATA_ROOT=../sparse-view/data/PLS6C/train
+MODEL_NAME=u-nn-20-256x2560
+
 set -ex
 python train.py \
---dataroot ../sparse-view/data/trap-pix2pix/train \
---name fly_korea_trap_pix2pix \
---model trap_pix2pix --netG unet_256 --direction BtoA --lambda_L1 100 --dataset_mode single --norm batch --pool_size 0 \
---lr 0.0002 --niter 200 --niter_decay 200 \
+--dataroot ${DATA_ROOT} \
+--name ${MODEL_NAME} \
+--model trap_pix2pix \
+--netT uniform \
+--netG unet_256 --direction BtoA \
+--lambda_L1 100 --lambda_TV 0 --gan_mode vanilla \
+--dataset_mode single --norm batch --pool_size 0 --num_data 10000 \
+--lr 0.0002 --niter 100 --niter_decay 100 \
 --input_nc 1 \
 --output_nc 1 \
---load_size 256 \
---crop_size 256 \
---num_threads 8 \
---gpu_ids 0,1
-# --epoch 100 --epoch_count 101 --continue_train \
+--load_size 256,2560 \
+--crop_size 256,2560 \
+--gpu_ids 0 \
+--alpha_min 0.08 --alpha_max 0.08 \
+--batch_size 8 \
+--display_port 8097 \
+--display_ncols 1 \
+--num_threads 8
+# --epoch 400 --epoch_count 401 --continue_train
